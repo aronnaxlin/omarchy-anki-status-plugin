@@ -17,10 +17,10 @@ then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable aronnax.anki
 
 ## What it shows
 
-- **Bar pill** — `󰀭 <due>` with the total cards due today. Hides itself when
+- **Bar pill** — The total cards due today. Hides itself when
   nothing is due.
-- **Hero** — card count status; trailing buttons for sync (󰓦), refresh (󰑓),
-  and opening Anki (󰣆).
+- **Hero** — card count status; trailing buttons for sync, refresh,
+  and opening Anki.
 - **Today's queues** — a scope picker for all decks or one top-level deck;
   new / learning / review, cards studied today with time, and 30-day mature
   retention update for that scope.
