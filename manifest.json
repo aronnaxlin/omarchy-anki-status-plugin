@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "aronnax.anki-status",
+  "name": "Anki Status",
+  "version": "1.0.0",
+  "author": "Aronnax Lin",
+  "license": "MIT",
+  "description": "Anki review load in the bar with a study panel: due cards, forecasts, deck breakdown, sync and review shortcuts.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Anki Status",
+    "description": "Anki review load in the bar with a study panel.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "forecastDays": 7
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 },
+      { "key": "forecastDays", "type": "integer", "label": "Forecast days", "min": 1, "max": 30, "step": 1, "defaultValue": 7 }
+    ]
+  }
+}

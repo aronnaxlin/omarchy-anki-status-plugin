@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""anki-status — read-only snapshot of the local Anki collection as JSON.
+
+Reads the Anki collection DB through SQLite's immutable mode — no locks, so
+Anki's own writes never stall us; the WAL tail (at most the review currently
+on screen) is skipped, which is fine for a status widget. Prints the record
+the Anki Status shell plugin consumes:
+
+  {
+    "running": bool,
+    "profile": str,
+    "collection": str,        # absolute path, may be ""
+    "new": int, "learn": int, "review": int, "due": int,
+    "studiedToday": int, "timeTodaySec": int,
+    "todayLimit": int,        # deck-config new-card daily cap (min over groups with unreviewed new cards); 0 = unlimited
+    "newRemaining": int,      # due new cards as the cap constrains them; equals "new" when uncapped
+    "retention": float,       # 30-day mature (ivl>=21d) correct rate, 0-1; -1 when no data
+    "forecast": [ { "day": "YYYY-MM-DD", "count": int } ],
+    "decks": [ { "name": str, "depth": int, "new": int, "learn": int, "review": int, "due": int, "newRemaining": int } ],
+    "error": str              # present on failure
+  }
+
+Usage: anki-status [--profile NAME] [--forecast-days N] [--collection PATH]
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ANKI_BASE = Path(os.environ.get("ANKI_BASE", Path.home() / ".local/share/Anki2"))
+
+
+def anki_running() -> bool:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", r"(^|/)anki(\s|$)"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def profiles() -> list[str]:
+    try:
+        return sorted(
+            p.name for p in ANKI_BASE.iterdir()
+            if p.is_dir() and (p / "collection.anki2").exists()
+        )
+    except OSError:
+        return []
+
+
+def pick_profile(requested: str | None) -> str | None:
+    available = profiles()
+    if not available:
+        return None
+    if requested:
+        return requested if requested in available else None
+    # Anki records the last-opened profile in prefs21.db; fall back to a lone
+    # profile, else the first alphabetically.
+    try:
+        db = sqlite3.connect(f"file:{ANKI_BASE / 'prefs21.db'}?mode=ro", uri=True)
+        row = db.execute("SELECT value FROM preferences WHERE key='profile'").fetchone()
+        db.close()
+        if row and row[0] in available:
+            return row[0]
+    except sqlite3.Error:
+        pass
+    return available[0]
+
+
+def config_value(con, key: str, default=None):
+    row = con.execute("SELECT val FROM config WHERE KEY=?", (key,)).fetchone()
+    if not row:
+        return default
+    raw = row[0]
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        # Older builds store plain strings/ints without JSON quoting.
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return raw.decode() if isinstance(raw, bytes) else default
+
+
+def day_boundary(con) -> tuple[float, int]:
+    """Returns (today_start_unix_sec, today_number).
+
+    today_number is Anki's day counter for review-card `due` values: days
+    elapsed since collection creation at the rollover hour. Rollover is the
+    local hour in the `rollover` config key (default 4am); `creationOffset`
+    pins the collection's creation timezone as minutes-west-of-UTC so the
+    anchor survives travel across timezones.
+    """
+    crt = con.execute("SELECT crt FROM col").fetchone()[0]
+    rollover = config_value(con, "rollover", 4)
+    offset_min = config_value(con, "creationOffset", None)
+    if offset_min is None:
+        offset_min = -time.localtime().tm_gmtoff // 60 if hasattr(time.localtime(), "tm_gmtoff") else -int(time.timezone // 60)
+    if isinstance(offset_min, str):
+        offset_min = int(offset_min)
+    # Collection-local midnight: crt shifted into the creation tz.
+    local_midnight = (crt - offset_min * 60) // 86400 * 86400
+    anchor = local_midnight + offset_min * 60 + rollover * 3600
+    now = time.time()
+    elapsed = now - anchor
+    day_number = int(elapsed // 86400)
+    today_start = anchor + day_number * 86400
+    return today_start, day_number
+
+
+# --- deck_config protobuf ------------------------------------------------
+#
+# Since 23.10 the daily new-card cap lives in deck_config.config, a protobuf
+# (anki/deck_config.proto DeckConfig). We need exactly one field:
+# new.per_day — inside the DailyLimits message (field 1), inner field 1.
+# A tiny hand-rolled wire parser avoids a protobuf dependency in the plugin.
+
+def read_varint(buf: bytes, i: int) -> tuple[int, int]:
+    shift = 0
+    result = 0
+    while True:
+        if i >= len(buf):
+            raise IndexError("truncated varint")
+        b = buf[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, i
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint too long")
+
+
+def iter_fields(buf: bytes):
+    i = 0
+    while i < len(buf):
+        key, i = read_varint(buf, i)
+        field, wire = key >> 3, key & 7
+        if field == 0:
+            return
+        if wire == 0:
+            val, i = read_varint(buf, i)
+            yield field, wire, val
+        elif wire == 2:
+            n, i = read_varint(buf, i)
+            if i + n > len(buf):
+                return
+            yield field, wire, buf[i:i + n]
+            i += n
+        elif wire == 5:
+            if i + 4 > len(buf):
+                return
+            yield field, wire, buf[i:i + 4]
+            i += 4
+        elif wire == 1:
+            if i + 8 > len(buf):
+                return
+            yield field, wire, buf[i:i + 8]
+            i += 8
+        else:
+            return
+
+
+def deck_config_new_per_day(blob: bytes) -> int:
+    """DeckConfig.other.new_per_day — 0 means unlimited.
+
+    Schema (anki/deck_config.proto): field 1 is `other` (DailyLimits-ish
+    legacy block in current builds); within it, field 1 is the new-card
+    daily cap. We scan every length-delimited submessage for a plausible
+    (1, varint) pair and prefer the one under top-level field 1.
+    """
+    try:
+        for field, wire, val in iter_fields(blob):
+            if field == 1 and wire == 2:
+                try:
+                    for f2, w2, v2 in iter_fields(val):
+                        if f2 == 1 and w2 == 0:
+                            return int(v2)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return 0
+
+
+def build_report(collection: Path, forecast_days: int) -> dict:
+    # Immutable mode: SQLite opens the file without taking locks, reading the
+    # last committed main-file state. The WAL tail (at most the currently open
+    # review) is skipped, which is fine for a status widget and keeps us from
+    # ever stalling behind Anki's own writes — a plain read or a backup-API
+    # copy can block indefinitely on Anki's write lock.
+    con = sqlite3.connect(f"file:{collection}?immutable=1", uri=True)
+    try:
+        return query_report(con, forecast_days)
+    finally:
+        con.close()
+
+
+def query_report(con: sqlite3.Connection, forecast_days: int) -> dict:
+    today_start_sec, today_number = day_boundary(con)
+    today_start_ms = int(today_start_sec * 1000)
+    day_len = 86400
+    day_cutoff_end = today_number + 1  # review due value that still counts as today
+
+    # --- today's queues ---------------------------------------------------
+    # Cards with odid set are buried/filtered-deck residents: excluded from
+    # today's queues the same way Anki's own counts exclude them.
+    new_today = con.execute(
+        "SELECT count(*) FROM cards WHERE queue=0 AND type=0 AND odid=0"
+    ).fetchone()[0]
+    learn_today = con.execute(
+        "SELECT count(*) FROM cards WHERE queue IN (1,3) AND odid=0 AND due <= ?",
+        (int(today_start_sec + day_len),),
+    ).fetchone()[0]
+    review_today = con.execute(
+        "SELECT count(*) FROM cards WHERE queue=2 AND odid=0 AND due <= ?",
+        (day_cutoff_end,),
+    ).fetchone()[0]
+
+    # --- studied today ----------------------------------------------------
+    studied = con.execute(
+        "SELECT count(*), coalesce(sum(time)/1000, 0) FROM revlog WHERE id >= ?",
+        (today_start_ms,),
+    ).fetchone()
+    studied_today, time_today_sec = int(studied[0]), int(studied[1] or 0)
+
+    # --- deck config: new-card daily caps ---------------------------------
+    # decks.common is a protobuf carrying the deck's config id (field 5);
+    # deck_config rows hold the preset blob with the per-day new cap.
+    conf_caps = {}
+    for conf_id, blob in con.execute("SELECT id, config FROM deck_config"):
+        conf_caps[int(conf_id)] = deck_config_new_per_day(blob)
+
+    def deck_conf_id(common: bytes) -> int:
+        try:
+            for field, wire, val in iter_fields(common):
+                if field == 5 and wire == 0:
+                    return int(val)
+        except Exception:
+            pass
+        return 1
+
+    # New cards already introduced today per preset, so the cap limits only
+    # what remains. type 1/2 = learning/review card that entered as new.
+    did_conf = {}
+    deck_names = {}
+    for did, name, common in con.execute("SELECT id, name, common FROM decks"):
+        did_conf[int(did)] = deck_conf_id(common)
+        deck_names[int(did)] = name
+
+    # Roll decks up to their tree root so the panel shows one row per
+    # top-level deck instead of one per nested list — a GRE\x1fList 30 tree
+    # is one study unit, not thirty rows.
+    def root_name(name: str) -> str:
+        return name.split("\x1f")[0]
+
+    new_introduced = {}
+    for did, count in con.execute(
+        """SELECT did, count(*) FROM cards
+           WHERE queue > 0 AND type IN (1,2)
+           GROUP BY did"""
+    ).fetchall():
+        conf_id = did_conf.get(int(did), 1)
+        new_introduced[conf_id] = new_introduced.get(conf_id, 0) + count
+
+    # Raw new backlog per deck, once — reused for the per-deck counts and
+    # the per-preset sibling sums.
+    deck_new_backlog = {}
+    for did, count in con.execute(
+        "SELECT did, count(*) FROM cards WHERE queue=0 AND type=0 AND odid=0 GROUP BY did"
+    ).fetchall():
+        deck_new_backlog[int(did)] = count
+
+    conf_remaining = {}
+    for conf_id, cap in conf_caps.items():
+        if cap > 0:
+            conf_remaining[conf_id] = max(0, cap - new_introduced.get(conf_id, 0))
+
+    deck_rows = {}
+    for did, name in deck_names.items():
+        name = root_name(name)
+        counts = con.execute(
+            """SELECT
+                 sum(CASE WHEN queue IN (1,3) AND odid=0 AND due <= ? THEN 1 ELSE 0 END),
+                 sum(CASE WHEN queue=2 AND odid=0 AND due <= ? THEN 1 ELSE 0 END)
+               FROM cards WHERE did = ?""",
+            (int(today_start_sec + day_len), day_cutoff_end, did),
+        ).fetchone()
+        learn_c, review_c = (int(v or 0) for v in counts)
+        new_c = deck_new_backlog.get(did, 0)
+        conf_id = did_conf.get(did, 1)
+        cap = conf_caps.get(conf_id, 0)
+        if new_c == 0:
+            new_remaining = 0
+        elif cap <= 0:
+            new_remaining = new_c
+        else:
+            # Split the preset's remaining capacity across its decks in
+            # proportion to each deck's raw new backlog — a fair stand-in
+            # for Anki's position-ordered draw.
+            sibling_new = sum(
+                backlog for other_did, backlog in deck_new_backlog.items()
+                if did_conf.get(other_did, 1) == conf_id
+            )
+            capacity = conf_remaining.get(conf_id, cap)
+            if sibling_new <= capacity:
+                new_remaining = new_c
+            else:
+                new_remaining = min(new_c, max(0, round(capacity * new_c / max(1, sibling_new))))
+        row = deck_rows.setdefault(name, {
+            "name": name, "depth": 0, "new": 0, "learn": 0, "review": 0,
+            "due": 0, "newRemaining": 0,
+        })
+        row["new"] += new_c
+        row["learn"] += learn_c
+        row["review"] += review_c
+        row["newRemaining"] += new_remaining
+        row["due"] += new_remaining + learn_c + review_c
+
+    # --- forecast: review cards due in the coming N days ------------------
+    horizon = forecast_days + 1  # include today at index 0
+    forecast = [0] * horizon
+    rows = con.execute(
+        """SELECT due - ?, count(*) FROM cards
+           WHERE queue=2 AND odid=0 AND due > ? AND due <= ?
+           GROUP BY due""",
+        (today_number, today_number, today_number + forecast_days),
+    ).fetchall()
+    for offset, count in rows:
+        if 0 < int(offset) <= forecast_days:
+            forecast[int(offset)] = int(count)
+    forecast[0] = review_today  # today: what's actually queued now
+
+    days = []
+    base = time.strftime("%Y-%m-%d", time.localtime(today_start_sec))
+    for i in range(horizon):
+        ts = today_start_sec + i * day_len
+        days.append({"day": time.strftime("%Y-%m-%d", time.localtime(ts)), "count": forecast[i]})
+
+    # --- 30-day mature retention ------------------------------------------
+    mature = con.execute(
+        """SELECT sum(CASE WHEN ease > 1 THEN 1 ELSE 0 END), count(*)
+           FROM revlog WHERE id >= ? AND lastIvl >= 21""",
+        (today_start_ms - 30 * day_len * 1000,),
+    ).fetchone()
+    retention = (mature[0] / mature[1]) if mature and mature[1] else -1.0
+
+    new_remaining_total = sum(d["newRemaining"] for d in deck_rows.values())
+    caps = [c for c in conf_caps.values() if c > 0]
+
+    return {
+        "profile": "",
+        "new": new_today,
+        "learn": learn_today,
+        "review": review_today,
+        "due": new_remaining_total + learn_today + review_today,
+        "newRemaining": new_remaining_total,
+        "studiedToday": studied_today,
+        "timeTodaySec": time_today_sec,
+        "todayLimit": min(caps) if caps else 0,
+        "retention": round(retention, 4) if retention >= 0 else -1,
+        "forecast": days,
+        "decks": sorted(
+            deck_rows.values(),
+            key=lambda d: (-d["due"], d["name"].lower()),
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Anki collection status as JSON")
+    parser.add_argument("--profile", default=None, help="Anki profile name (default: last used)")
+    parser.add_argument("--forecast-days", type=int, default=7)
+    parser.add_argument("--collection", default=None, help="Path to collection.anki2 (skips profile lookup)")
+    args = parser.parse_args()
+
+    report = {"running": anki_running(), "profile": "", "collection": "", "error": ""}
+
+    try:
+        if args.collection:
+            collection = Path(args.collection).expanduser()
+            report["profile"] = collection.parent.name
+        else:
+            profile = pick_profile(args.profile)
+            if not profile:
+                report["error"] = "No Anki profile with a collection found under " + str(ANKI_BASE)
+                print(json.dumps(report))
+                return 0
+            report["profile"] = profile
+            collection = ANKI_BASE / profile / "collection.anki2"
+        if not collection.exists():
+            report["error"] = "Collection not found: " + str(collection)
+            print(json.dumps(report))
+            return 0
+        report["collection"] = str(collection)
+        data = build_report(collection, max(1, min(30, args.forecast_days)))
+        data.pop("profile", None)
+        report.update(data)
+    except Exception as exc:  # surface as JSON, never crash the panel
+        report["error"] = f"{type(exc).__name__}: {exc}"
+
+    print(json.dumps(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
