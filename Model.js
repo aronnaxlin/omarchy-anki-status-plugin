@@ -1,12 +1,16 @@
 // Pure helpers for the Anki Status panel. Kept side-effect free so the QML
 // stays declarative and every transform here is unit-testable in isolation.
 
-// Bar pill text: " 18872" — icon + total due. Empty hides the widget.
-function barLabel(report) {
+// Bar pill text is the icon plus the selected daily metric. A zero due count
+// leaves the icon visible so its interactive display setting stays reachable.
+function barLabel(report, metric) {
   if (!report || report.error) return ""
+  var iconText = icon(report)
+  if (metric === "Icon only") return iconText
+  if (metric === "Cards studied") return iconText + " " + intVal(report.studiedToday)
+  if (metric === "Study time") return iconText + " " + formatMinutes(report.timeTodaySec)
   var due = intVal(report.due)
-  if (due <= 0) return ""
-  return "󰀭 " + due
+  return due > 0 ? iconText + " " + due : iconText
 }
 
 function icon(report) {

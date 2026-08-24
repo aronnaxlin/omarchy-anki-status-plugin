@@ -18,11 +18,13 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 300,
-      "forecastDays": 7
+      "forecastDays": 7,
+      "barMetric": "Due cards"
     },
     "schema": [
       { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 },
-      { "key": "forecastDays", "type": "integer", "label": "Forecast days", "min": 1, "max": 30, "step": 1, "defaultValue": 7 }
+      { "key": "forecastDays", "type": "integer", "label": "Forecast days", "min": 1, "max": 30, "step": 1, "defaultValue": 7 },
+      { "key": "barMetric", "type": "enum", "label": "Bar display", "options": ["Due cards", "Cards studied", "Study time", "Icon only"], "defaultValue": "Due cards", "description": "The daily metric beside the Anki icon. Icon only keeps the icon without a number." }
     ]
   }
 }

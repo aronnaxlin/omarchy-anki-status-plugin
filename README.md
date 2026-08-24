@@ -1,8 +1,8 @@
 # Anki Status
 
-Anki review load in the Omarchy bar: a pill with the due count and a popup
-panel with today's queues, the week-ahead forecast, per-deck breakdown, and
-sync/review shortcuts.
+Anki review load in the Omarchy bar: an icon with a configurable daily metric
+and a popup panel with today's queues, the week-ahead forecast, per-deck
+breakdown, and sync/review shortcuts.
 
 ![Panel](docs/panel.png)
 
@@ -17,8 +17,9 @@ then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable aronnax.anki
 
 ## What it shows
 
-- **Bar pill** — The total cards due today. Hides itself when
-  nothing is due.
+- **Bar pill** — The selected daily metric: cards due (default), cards
+  studied, study time, or icon only. With no cards due, it shows only the
+  icon so the interactive display selector remains available.
 - **Hero** — card count status; trailing buttons for sync, refresh,
   and opening Anki.
 - **Today's queues** — a scope picker for all decks or one top-level deck;
@@ -48,16 +49,19 @@ protobuf dependency).
   or via the shell target: `omarchy-shell shell toggle aronnax.anki-status '{}'`.
 
 ## Settings
-
-Settings live in the widget's entry in `~/.config/omarchy/shell.json`:
+Settings are available from the **Bar display** selector in the Anki popup and
+are saved to the widget's entry in `~/.config/omarchy/shell.json`.
 
 | Key | Default | What it does |
 |---|---|---|
 | `refreshIntervalSec` | `300` | How often the status snapshot regenerates |
 | `forecastDays` | `7` | How many days the forecast chart covers |
+| `barMetric` | `Due cards` | Bar content: `Due cards`, `Cards studied`, `Study time`, or `Icon only` |
+
+The selector updates immediately. Command-line configuration remains available:
 
 ```bash
-omarchy bar set aronnax.anki-status refreshIntervalSec 120 --json
+omarchy bar set aronnax.anki-status barMetric 'Study time' --json
 ```
 
 ## License

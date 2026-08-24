@@ -22,6 +22,7 @@ Panel {
   readonly property string collector: Quickshell.env("HOME") + "/.config/omarchy/plugins/aronnax.anki-status/bin/anki-status"
   readonly property int refreshIntervalSec: setting("refreshIntervalSec", 300)
   readonly property int forecastDays: setting("forecastDays", 7)
+  readonly property string barMetric: String(setting("barMetric", "Due cards"))
 
   // Theme-independent aliases so deep children don't repeat the `bar ?` dance.
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -30,7 +31,7 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   property var report: null
-  property string label: Model.barLabel(report)
+  property string label: Model.barLabel(report, barMetric)
   // Stats scope: "" = whole profile; otherwise a top-level deck name from
   // report.decks. A stale name (deck renamed/deleted) falls back to
   // profile-wide stats in statsSource.
@@ -43,6 +44,23 @@ Panel {
       names.push(root.report.decks[i].name)
     return names
   }
+
+  readonly property var scopeOptions: {
+    var options = [{ value: "", label: "All decks" }]
+    if (!root.report || !root.report.decks) return options
+    for (var i = 0; i < root.report.decks.length; i++) {
+      var name = root.report.decks[i].name
+      options.push({ value: name, label: name })
+    }
+    return options
+  }
+
+  readonly property var barMetricOptions: [
+    { value: "Due cards", label: "Due cards" },
+    { value: "Cards studied", label: "Cards studied" },
+    { value: "Study time", label: "Study time" },
+    { value: "Icon only", label: "Icon only" }
+  ]
 
   // The object the stats grid reads: the profile report, or the selected
   // deck row when its name still exists in the report.
@@ -63,6 +81,26 @@ Panel {
     i = (i + direction + options.length) % options.length
     root.scopeDeck = options[i]
   }
+
+  // Persist interactive bar preferences through the shell's inline widget
+  // settings. Applying locally keeps the label responsive before shell.json
+  // notifies the bar back with the same value.
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings)
+      if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function setBarMetric(value) {
+    if (value !== root.barMetric) root.persistSettings({ barMetric: value })
+  }
+
+  onScopeDeckChanged: scopeSelector.value = root.scopeDeck
+  onBarMetricChanged: barDisplaySelector.value = root.barMetric
 
   function refresh() {
     if (collectorProc.running) return
@@ -165,6 +203,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
+        if (scopeSelector.popupOpen || barDisplaySelector.popupOpen) return
         if (t === "r" || t === "R") root.refresh()
         else if (t === "s" || t === "S") root.syncNow()
         else if (t === "o" || t === "O") root.launchAnki()
@@ -260,13 +299,13 @@ Panel {
         // ---------- Today's queues ----------
         PanelSeparator { foreground: root.foreground }
 
-        // Scope selector: which deck the stats below describe. Tapping the
-        // name opens the deck list; ‹ › and the d key cycle without it.
-        // Only shown when there's a real choice to make.
+        // Scope selector: the native dropdown keeps long deck names clipped
+        // in the trigger while showing the complete name in its themed popup.
+        // It is only shown when there is a real choice to make.
         Row {
           visible: root.report && root.report.decks && root.report.decks.length > 1
           width: parent.width
-          height: visible ? Math.max(scopeTitle.implicitHeight, scopeLabel.implicitHeight, prevScope.implicitHeight, nextScope.implicitHeight) : 0
+          height: visible ? Math.max(scopeTitle.implicitHeight, scopeSelector.implicitHeight) : 0
           spacing: Style.space(8)
 
           Text {
@@ -280,59 +319,16 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
           }
 
-          // Push the controls to the right edge. max(0, …): the spacer
-          // must never go negative on narrow panels.
-          Item { width: Math.max(0, parent.width - scopeTitle.width - scopeLabel.width - prevScope.width - nextScope.width - parent.spacing * 4); height: 1 }
-
-          PanelActionButton {
-            id: prevScope
-            iconText: "󰅁"
-            tooltipText: "Previous deck"
+          Dropdown {
+            id: scopeSelector
+            width: Math.max(0, parent.width - scopeTitle.implicitWidth - parent.spacing)
+            anchors.verticalCenter: parent.verticalCenter
+            showLabel: false
+            value: root.scopeDeck
+            options: root.scopeOptions
             foreground: root.foreground
             fontFamily: root.fontFamily
-            anchors.verticalCenter: parent.verticalCenter
-            onClicked: root.cycleScope(-1)
-          }
-
-          Text {
-            id: scopeLabel
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.scopeDeck === "" ? "All decks" : root.scopeDeck
-            color: root.scopeDeck === "" ? root.dim : root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            font.bold: root.scopeDeck !== ""
-            elide: Text.ElideRight
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: scopeMenu.visible ? scopeMenu.close() : scopeMenu.open()
-            }
-
-            Menu {
-              id: scopeMenu
-              y: scopeLabel.height
-
-              Repeater {
-                model: [""].concat(root.deckNames())
-                delegate: MenuItem {
-                  required property var modelData
-                  text: modelData === "" ? "All decks" : modelData
-                  onTriggered: root.scopeDeck = modelData
-                }
-              }
-            }
-          }
-
-          PanelActionButton {
-            id: nextScope
-            iconText: "󰅂"
-            tooltipText: "Next deck"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            anchors.verticalCenter: parent.verticalCenter
-            onClicked: root.cycleScope(1)
+            onChanged: function(value) { root.scopeDeck = value }
           }
         }
 
@@ -382,6 +378,20 @@ Panel {
               ? Model.intVal(root.report.newRemaining) + " / " + root.report.todayLimit
               : ""
           }
+        }
+
+        // ---------- Bar display ----------
+        PanelSeparator { foreground: root.foreground }
+
+        Dropdown {
+          id: barDisplaySelector
+          width: parent.width
+          label: "BAR DISPLAY"
+          value: root.barMetric
+          options: root.barMetricOptions
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onChanged: function(value) { root.setBarMetric(value) }
         }
 
         // ---------- Forecast ----------
