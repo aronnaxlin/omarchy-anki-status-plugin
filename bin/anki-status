@@ -16,7 +16,11 @@ the Anki Status shell plugin consumes:
     "newRemaining": int,      # due new cards as the cap constrains them; equals "new" when uncapped
     "retention": float,       # 30-day mature (ivl>=21d) correct rate, 0-1; -1 when no data
     "forecast": [ { "day": "YYYY-MM-DD", "count": int } ],
-    "decks": [ { "name": str, "depth": int, "new": int, "learn": int, "review": int, "due": int, "newRemaining": int } ],
+    "decks": [ {
+      "name": str, "depth": int,
+      "new": int, "learn": int, "review": int, "due": int, "newRemaining": int,
+      "studiedToday": int, "timeTodaySec": int, "retention": float
+    } ],
     "error": str              # present on failure
   }
 
@@ -233,6 +237,18 @@ def query_report(con: sqlite3.Connection, forecast_days: int) -> dict:
     ).fetchone()
     studied_today, time_today_sec = int(studied[0]), int(studied[1] or 0)
 
+    # Same, per deck: revlog carries cid, not did, so resolve through cards.
+    # A deleted card's reviews still count toward the profile total but fall
+    # out of every deck row — acceptable drift for a status widget.
+    deck_studied: dict[int, list[int]] = {}
+    for did, count, secs in con.execute(
+        """SELECT c.did, count(*), coalesce(sum(r.time)/1000, 0)
+           FROM revlog r JOIN cards c ON c.id = r.cid
+           WHERE r.id >= ? GROUP BY c.did""",
+        (today_start_ms,),
+    ).fetchall():
+        deck_studied[int(did)] = [int(count), int(secs or 0)]
+
     # --- deck config: new-card daily caps ---------------------------------
     # decks.common is a protobuf carrying the deck's config id (field 5);
     # deck_config rows hold the preset blob with the per-day new cap.
@@ -318,13 +334,16 @@ def query_report(con: sqlite3.Connection, forecast_days: int) -> dict:
                 new_remaining = min(new_c, max(0, round(capacity * new_c / max(1, sibling_new))))
         row = deck_rows.setdefault(name, {
             "name": name, "depth": 0, "new": 0, "learn": 0, "review": 0,
-            "due": 0, "newRemaining": 0,
+            "due": 0, "newRemaining": 0, "studiedToday": 0, "timeTodaySec": 0,
         })
         row["new"] += new_c
         row["learn"] += learn_c
         row["review"] += review_c
         row["newRemaining"] += new_remaining
         row["due"] += new_remaining + learn_c + review_c
+        studied_c, time_c = deck_studied.get(did, [0, 0])
+        row["studiedToday"] += studied_c
+        row["timeTodaySec"] += time_c
 
     # --- forecast: review cards due in the coming N days ------------------
     horizon = forecast_days + 1  # include today at index 0
@@ -340,6 +359,7 @@ def query_report(con: sqlite3.Connection, forecast_days: int) -> dict:
             forecast[int(offset)] = int(count)
     forecast[0] = review_today  # today: what's actually queued now
 
+
     days = []
     base = time.strftime("%Y-%m-%d", time.localtime(today_start_sec))
     for i in range(horizon):
@@ -354,8 +374,26 @@ def query_report(con: sqlite3.Connection, forecast_days: int) -> dict:
     ).fetchone()
     retention = (mature[0] / mature[1]) if mature and mature[1] else -1.0
 
+    # Per-deck 30-day mature retention, rolled up to the tree root.
+    deck_retention: dict[str, list[int]] = {}
+    for did, correct, total in con.execute(
+        """SELECT c.did,
+                  sum(CASE WHEN r.ease > 1 THEN 1 ELSE 0 END), count(*)
+           FROM revlog r JOIN cards c ON c.id = r.cid
+           WHERE r.id >= ? AND r.lastIvl >= 21 GROUP BY c.did""",
+        (today_start_ms - 30 * day_len * 1000,),
+    ).fetchall():
+        name = root_name(deck_names.get(int(did), ""))
+        acc = deck_retention.setdefault(name, [0, 0])
+        acc[0] += int(correct or 0)
+        acc[1] += int(total)
+
     new_remaining_total = sum(d["newRemaining"] for d in deck_rows.values())
     caps = [c for c in conf_caps.values() if c > 0]
+
+    for name, row in deck_rows.items():
+        correct, total = deck_retention.get(name, [0, 0])
+        row["retention"] = round(correct / total, 4) if total else -1
 
     return {
         "profile": "",

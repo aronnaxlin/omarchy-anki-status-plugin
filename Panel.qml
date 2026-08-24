@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -21,8 +23,46 @@ Panel {
   readonly property int refreshIntervalSec: setting("refreshIntervalSec", 300)
   readonly property int forecastDays: setting("forecastDays", 7)
 
+  // Theme-independent aliases so deep children don't repeat the `bar ?` dance.
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color dim: Qt.darker(foreground, 1.45)
+  readonly property color dimmer: Qt.darker(foreground, 1.75)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
   property var report: null
   property string label: Model.barLabel(report)
+  // Stats scope: "" = whole profile; otherwise a top-level deck name from
+  // report.decks. A stale name (deck renamed/deleted) falls back to
+  // profile-wide stats in statsSource.
+  property string scopeDeck: ""
+
+  function deckNames() {
+    if (!root.report || !root.report.decks) return []
+    var names = []
+    for (var i = 0; i < root.report.decks.length; i++)
+      names.push(root.report.decks[i].name)
+    return names
+  }
+
+  // The object the stats grid reads: the profile report, or the selected
+  // deck row when its name still exists in the report.
+  readonly property var statsSource: {
+    if (!root.report || !root.report.decks) return root.report
+    if (root.scopeDeck === "") return root.report
+    for (var i = 0; i < root.report.decks.length; i++) {
+      if (root.report.decks[i].name === root.scopeDeck)
+        return root.report.decks[i]
+    }
+    return root.report
+  }
+
+  function cycleScope(direction) {
+    var options = [""].concat(deckNames())
+    var i = options.indexOf(root.scopeDeck)
+    if (i < 0) i = 0
+    i = (i + direction + options.length) % options.length
+    root.scopeDeck = options[i]
+  }
 
   function refresh() {
     if (collectorProc.running) return
@@ -33,6 +73,10 @@ Panel {
   function syncNow() {
     if (syncProc.running) return
     syncProc.running = true
+  }
+
+  function launchAnki() {
+    Quickshell.execDetached(["anki"])
   }
 
   Process {
@@ -105,7 +149,9 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(560))
+    // fittedContentWidth caps against the screen at any scale; 420px logical
+    // is the design width, scaled by the theme's spacing scale.
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -122,6 +168,8 @@ Panel {
         if (t === "r" || t === "R") root.refresh()
         else if (t === "s" || t === "S") root.syncNow()
         else if (t === "o" || t === "O") root.launchAnki()
+        else if (t === "d" || t === "D") root.cycleScope(1)
+        else if (t === "a" || t === "A") root.scopeDeck = ""
       }
 
       Column {
@@ -129,7 +177,7 @@ Panel {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        spacing: Style.space(14)
+        spacing: Style.space(16)
 
         // ---------- Hero: icon · title/status · action buttons ----------
         Item {
@@ -139,8 +187,8 @@ Panel {
           Text {
             id: heroIcon
             text: Model.icon(root.report)
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
+            color: root.foreground
+            font.family: root.fontFamily
             font.pixelSize: Style.font.display
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
@@ -158,8 +206,8 @@ Panel {
 
             Text {
               text: "Anki"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
+              color: root.foreground
+              font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
               elide: Text.ElideRight
@@ -168,8 +216,8 @@ Panel {
 
             Text {
               text: Model.heroStatus(root.report).toUpperCase()
-              color: Qt.darker(root.bar.foreground, 1.4)
-              font.family: root.bar.fontFamily
+              color: root.dim
+              font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
               font.letterSpacing: 1.2
@@ -187,70 +235,159 @@ Panel {
             PanelActionButton {
               iconText: "󰓦"
               tooltipText: "Sync now"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.foreground
+              fontFamily: root.fontFamily
               enabled: !syncProc.running
               onClicked: root.syncNow()
             }
             PanelActionButton {
               iconText: "󰑓"
               tooltipText: "Refresh"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.foreground
+              fontFamily: root.fontFamily
               onClicked: root.refresh()
             }
             PanelActionButton {
               iconText: "󰣆"
               tooltipText: "Open Anki"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.foreground
+              fontFamily: root.fontFamily
               onClicked: root.launchAnki()
             }
           }
         }
 
         // ---------- Today's queues ----------
-        PanelSeparator { foreground: root.bar.foreground }
+        PanelSeparator { foreground: root.foreground }
 
-        // Item wrapper so inner widths anchor against something that never
-        // goes through a positioner — a Row child reporting implicitWidth
-        // from content children can't feed those children's own widths.
-        Item {
+        // Scope selector: which deck the stats below describe. Tapping the
+        // name opens the deck list; ‹ › and the d key cycle without it.
+        // Only shown when there's a real choice to make.
+        Row {
+          visible: root.report && root.report.decks && root.report.decks.length > 1
           width: parent.width
-          implicitHeight: Math.max(queueLeft.implicitHeight, queueRight.implicitHeight)
+          height: visible ? Math.max(scopeTitle.implicitHeight, scopeLabel.implicitHeight, prevScope.implicitHeight, nextScope.implicitHeight) : 0
+          spacing: Style.space(8)
 
-          Column {
-            id: queueLeft
-            anchors.left: parent.left
-            width: Math.round(parent.width * 0.4)
-            spacing: Style.space(10)
-            InfoPair { label: "New"; value: root.report ? String(Model.intVal(root.report.new)) : "—" }
-            InfoPair { label: "Learning"; value: root.report ? String(Model.intVal(root.report.learn)) : "—" }
+          Text {
+            id: scopeTitle
+            text: "SCOPE"
+            color: root.dimmer
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            anchors.verticalCenter: parent.verticalCenter
           }
-          Column {
-            id: queueRight
-            anchors.left: queueLeft.right
-            anchors.leftMargin: Style.space(24)
-            anchors.right: parent.right
-            spacing: Style.space(10)
-            InfoPair { label: "Review"; value: root.report ? String(Model.intVal(root.report.review)) : "—" }
-            InfoPair {
-              label: "Studied today"
-              value: root.report
-                ? root.report.studiedToday + " cards · " + Model.formatMinutes(root.report.timeTodaySec)
-                : "—"
+
+          // Push the controls to the right edge. max(0, …): the spacer
+          // must never go negative on narrow panels.
+          Item { width: Math.max(0, parent.width - scopeTitle.width - scopeLabel.width - prevScope.width - nextScope.width - parent.spacing * 4); height: 1 }
+
+          PanelActionButton {
+            id: prevScope
+            iconText: "󰅁"
+            tooltipText: "Previous deck"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.cycleScope(-1)
+          }
+
+          Text {
+            id: scopeLabel
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.scopeDeck === "" ? "All decks" : root.scopeDeck
+            color: root.scopeDeck === "" ? root.dim : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: root.scopeDeck !== ""
+            elide: Text.ElideRight
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: scopeMenu.visible ? scopeMenu.close() : scopeMenu.open()
             }
-            InfoPair {
-              label: "Mature retention (30d)"
-              value: root.report && root.report.retention >= 0 ? Model.formatRetention(root.report.retention) : "—"
+
+            Menu {
+              id: scopeMenu
+              y: scopeLabel.height
+
+              Repeater {
+                model: [""].concat(root.deckNames())
+                delegate: MenuItem {
+                  required property var modelData
+                  text: modelData === "" ? "All decks" : modelData
+                  onTriggered: root.scopeDeck = modelData
+                }
+              }
             }
+          }
+
+          PanelActionButton {
+            id: nextScope
+            iconText: "󰅂"
+            tooltipText: "Next deck"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.cycleScope(1)
+          }
+        }
+
+        // GridLayout, not paired Columns: equal cells at any width, and the
+        // StatCell values align on a shared baseline per row. Third row only
+        // exists when there's retention data — GridLayout skips invisible
+        // cells without leaving a hole.
+        GridLayout {
+          width: parent.width
+          columns: 2
+          columnSpacing: Style.space(24)
+          rowSpacing: Style.space(14)
+
+          StatCell {
+            Layout.fillWidth: true
+            label: "New"
+            value: root.statsSource ? String(Model.intVal(root.statsSource.new)) : "—"
+          }
+          StatCell {
+            Layout.fillWidth: true
+            label: "Review"
+            value: root.statsSource ? String(Model.intVal(root.statsSource.review)) : "—"
+          }
+          StatCell {
+            Layout.fillWidth: true
+            label: "Learning"
+            value: root.statsSource ? String(Model.intVal(root.statsSource.learn)) : "—"
+          }
+          StatCell {
+            Layout.fillWidth: true
+            label: "Studied today"
+            value: root.statsSource
+              ? Model.intVal(root.statsSource.studiedToday) + " cards · " + Model.formatMinutes(root.statsSource.timeTodaySec)
+              : "—"
+          }
+          StatCell {
+            Layout.fillWidth: true
+            visible: root.statsSource && root.statsSource.retention >= 0
+            label: "Retention 30d"
+            value: root.statsSource && root.statsSource.retention >= 0 ? Model.formatRetention(root.statsSource.retention) : ""
+          }
+          StatCell {
+            Layout.fillWidth: true
+            visible: root.scopeDeck === "" && root.report && root.report.todayLimit > 0
+            label: "New card cap"
+            value: root.report && root.report.todayLimit > 0
+              ? Model.intVal(root.report.newRemaining) + " / " + root.report.todayLimit
+              : ""
           }
         }
 
         // ---------- Forecast ----------
         PanelSeparator {
           visible: forecastColumn.visible
-          foreground: root.bar.foreground
+          foreground: root.foreground
         }
 
         Column {
@@ -261,15 +398,16 @@ Panel {
 
           PanelSectionHeader {
             text: "NEXT " + (root.report ? root.report.forecast.length - 1 : 0) + " DAYS"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
+            foreground: root.foreground
+            fontFamily: root.fontFamily
           }
 
-                    Row {
+          Row {
             id: forecastRow
             width: parent.width
-            height: Style.space(64)
-            spacing: Style.space(6)
+            // Track height covers the tallest bar + count + weekday letter.
+            height: Style.space(72)
+            spacing: Style.space(8)
 
             Repeater {
               model: root.report ? root.report.forecast : []
@@ -283,42 +421,50 @@ Panel {
                 readonly property int count: Model.intVal(modelData.count)
                 readonly property int maxCount: Model.forecastMax(root.report ? root.report.forecast : [])
 
-                // Bar centered in the cell, rising off the baseline above
-                // the weekday letter; count label floats at the bar tip.
-                Rectangle {
-                  id: barRect
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  anchors.bottom: weekdayLetter.top
-                  anchors.bottomMargin: Style.space(2)
-                  width: Math.max(Style.space(8), Math.min(parent.width * 0.72, Style.space(28)))
-                  height: Math.max(
-                    Style.space(2),
-                    (forecastDay.count / forecastDay.maxCount) * Style.space(34)
-                  )
-                  radius: Math.min(Style.space(3), width / 2)
-                  color: forecastDay.index === 0 ? Color.accent : root.bar.foreground
-                  opacity: forecastDay.index === 0 ? 1.0 : 0.45
-                }
-
-                Text {
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  anchors.bottom: barRect.top
-                  anchors.bottomMargin: Style.space(2)
-                  visible: forecastDay.count > 0
-                  text: forecastDay.count
-                  color: Qt.darker(root.bar.foreground, 1.3)
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  id: weekdayLetter
-                  anchors.horizontalCenter: parent.horizontalCenter
+                // Count label sits at the bar tip; bar rises off the
+                // baseline above the weekday letter. Column-of-three keeps
+                // the geometry in one place, and the count label's slot is
+                // reserved even when the count is zero so bars stay aligned.
+                Column {
                   anchors.bottom: parent.bottom
-                  text: Model.weekdayLetter(modelData.day)
-                  color: Qt.darker(root.bar.foreground, 1.5)
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.caption
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  spacing: Style.space(2)
+
+                  Item {
+                    width: Math.max(countText.implicitWidth, barRect.width)
+                    height: countText.implicitHeight
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    Text {
+                      id: countText
+                      anchors.centerIn: parent
+                      visible: forecastDay.count > 0
+                      text: forecastDay.count
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Rectangle {
+                    id: barRect
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: Math.max(Style.space(10), Math.min(forecastDay.width * 0.7, Style.space(24)))
+                    height: Math.max(
+                      Style.space(3),
+                      (forecastDay.count / forecastDay.maxCount) * Style.space(36)
+                    )
+                    radius: Math.min(Style.space(3), width / 2)
+                    color: forecastDay.index === 0 ? Color.accent : root.foreground
+                    opacity: forecastDay.index === 0 ? 1.0 : 0.45
+                  }
+
+                  Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: Model.weekdayLetter(modelData.day)
+                    color: root.dimmer
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
             }
@@ -327,51 +473,75 @@ Panel {
 
         // ---------- Decks ----------
         PanelSeparator {
-          visible: deckList.model && deckList.model.length > 0
-          foreground: root.bar.foreground
+          visible: deckList.count > 0
+          foreground: root.foreground
         }
 
         Column {
-          visible: deckList.model && deckList.model.length > 0
+          visible: deckList.count > 0
           width: parent.width
           spacing: Style.space(10)
 
           PanelSectionHeader {
             text: "DECKS"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
+            foreground: root.foreground
+            fontFamily: root.fontFamily
           }
 
           ListView {
             id: deckList
             width: parent.width
-            height: Math.min(contentHeight, Style.space(160))
+            height: Math.min(contentHeight, Style.space(170))
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             interactive: contentHeight > height
             model: root.report ? root.report.decks : []
             spacing: Style.space(8)
 
-            delegate: Row {
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+            // Deck name left, counts right-aligned in fixed-width slots so
+            // the · separators stack vertically down the list.
+            delegate: Item {
               required property var modelData
               width: ListView.view.width
-              spacing: Style.space(10)
+              implicitHeight: deckRow.implicitHeight
 
-              Text {
-                width: parent.width - parent.spacing - dueText.implicitWidth
-                text: modelData.name
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideRight
-              }
+              Row {
+                id: deckRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: Style.space(10)
 
-              Text {
-                id: dueText
-                text: modelData.new + " · " + modelData.learn + " · " + modelData.review
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                Text {
+                  width: Math.max(0, parent.width - countsRow.implicitWidth - parent.spacing)
+                  text: modelData.name
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
+                Row {
+                  id: countsRow
+                  spacing: 0
+
+                  CountSlot { value: modelData.new; strong: modelData.new > 0 }
+                  Text {
+                    text: " · "
+                    color: root.dimmer
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  CountSlot { value: modelData.learn; strong: modelData.learn > 0 }
+                  Text {
+                    text: " · "
+                    color: root.dimmer
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  CountSlot { value: modelData.review; strong: modelData.review > 0 }
+                }
               }
             }
           }
@@ -382,8 +552,8 @@ Panel {
           visible: root.report && root.report.error
           width: parent.width
           text: root.report ? root.report.error : ""
-          color: root.bar.urgent
-          font.family: root.bar.fontFamily
+          color: root.bar ? root.bar.urgent : Color.urgent
+          font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.WordWrap
         }
@@ -391,47 +561,58 @@ Panel {
     }
   }
 
-  function launchAnki() {
-    Quickshell.execDetached(["anki"])
-  }
+  // ---------- components ----------
 
-  // ---------- row helpers ----------
-  // Label over value. Text widths anchor against pairColumn (anchors don't
-  // feed implicit size back the way `width: parent.width` would — that
-  // binding loops Item.width → implicitWidth → pairColumn.implicitWidth →
-  // Text.implicitWidth → Text.width and the pair collapses to 0×0).
-  component InfoPair: Item {
+  // Stat grid cell: small-caps label over a bold value. Text widths anchor
+  // against the inner column (a `width: parent.width` binding would loop
+  // Item.width → implicitWidth → column.implicitWidth → Text.implicitWidth
+  // → Text.width and collapse the cell to 0×0 inside the Layout).
+  component StatCell: Item {
     property string label: ""
     property string value: ""
-    implicitWidth: Math.max(labelText.implicitWidth, valueText.implicitWidth)
-    implicitHeight: pairColumn.implicitHeight
+    implicitHeight: statColumn.implicitHeight
 
     Column {
-      id: pairColumn
+      id: statColumn
       anchors.left: parent.left
       anchors.right: parent.right
-      spacing: Style.space(1)
+      spacing: Style.space(3)
 
       Text {
-        id: labelText
         anchors.left: parent.left
         anchors.right: parent.right
-        text: label
-        color: Qt.darker(root.bar.foreground, 1.4)
-        font.family: root.bar.fontFamily
+        text: label.toUpperCase()
+        color: root.dimmer
+        font.family: root.fontFamily
         font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1.2
         elide: Text.ElideRight
       }
       Text {
-        id: valueText
         anchors.left: parent.left
         anchors.right: parent.right
         text: value
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.bodySmall
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
         elide: Text.ElideRight
       }
     }
+  }
+
+  // Right-aligned number in a 4-digit slot: digits line up down the deck
+  // list regardless of count width.
+  component CountSlot: Text {
+    property int value: 0
+    property bool strong: false
+    width: Math.max(implicitWidth, Style.space(34))
+    horizontalAlignment: Text.AlignRight
+    text: value
+    color: strong ? root.foreground : root.dimmer
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+    font.bold: strong
   }
 }

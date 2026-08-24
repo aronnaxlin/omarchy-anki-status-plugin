@@ -21,8 +21,9 @@ then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable aronnax.anki
   nothing is due.
 - **Hero** — card count status; trailing buttons for sync (󰓦), refresh (󰑓),
   and opening Anki (󰣆).
-- **Today's queues** — new / learning / review, cards studied today with time,
-  and 30-day mature retention.
+- **Today's queues** — a scope picker for all decks or one top-level deck;
+  new / learning / review, cards studied today with time, and 30-day mature
+  retention update for that scope.
 - **Forecast** — review cards due across the next N days, today highlighted.
 - **Decks** — one row per top-level deck (subdecks roll up), `new · learn · review`.
 
@@ -40,8 +41,9 @@ protobuf dependency).
 ## Interactions
 
 - Bar pill: left = panel, right = sync, middle = refresh.
-- Panel: `r` refresh, `s` sync, `o` open Anki, Tab moves to the neighboring
-  bar panel, Esc closes.
+- Panel: `r` refresh, `s` sync, `o` open Anki, `d` cycles the statistics
+  scope, `a` restores all decks; Tab moves to the neighboring bar panel, Esc
+  closes.
 - IPC: `omarchy-shell aronnax.anki-status <open|close|toggle|refresh|sync>` —
   or via the shell target: `omarchy-shell shell toggle aronnax.anki-status '{}'`.
 
