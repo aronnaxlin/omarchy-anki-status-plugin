@@ -158,19 +158,42 @@ Panel {
 
   // ------------------------------------------------------------ bar pill
 
-  visible: root.label !== ""
+  visible: root.report && !root.report.error
   implicitWidth: visible ? button.implicitWidth : 0
   implicitHeight: visible ? button.implicitHeight : 0
 
-  BarIconButton {
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.label
-    slotSize: Style.bar.iconSlot * 2
+    labelVisible: false
+    hasVisualContent: root.report && !root.report.error
+    fixedWidth: button.vertical ? Style.bar.iconSlot : barContent.implicitWidth + Style.space(12)
     tooltipText: root.report && !root.report.error
       ? "Anki — " + Model.intVal(root.report.due) + " due · " + root.report.studiedToday + " studied"
       : "Anki"
+
+    Row {
+      id: barContent
+      anchors.centerIn: parent
+      spacing: Style.space(4)
+
+      AnkiIcon {
+        iconSize: Style.bar.iconCanvas
+        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        visible: root.label !== ""
+        text: root.label
+        color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.bar.iconFont
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
+
     onPressed: function(b) {
       if (b === Qt.RightButton) root.syncNow()
       else if (b === Qt.MiddleButton) root.refresh()
@@ -223,12 +246,10 @@ Panel {
           width: parent.width
           implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroActions.implicitHeight)
 
-          Text {
+          AnkiIcon {
             id: heroIcon
-            text: Model.icon(root.report)
+            iconSize: Style.font.display
             color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.display
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             opacity: root.report && root.report.running ? 1.0 : 0.5

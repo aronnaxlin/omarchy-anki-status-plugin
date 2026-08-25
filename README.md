@@ -64,6 +64,11 @@ The selector updates immediately. Command-line configuration remains available:
 omarchy bar set aronnax.anki-status barMetric 'Study time' --json
 ```
 
+## Credits
+
+The Anki mark in `anki.svg` is from [Simple Icons](https://simpleicons.org/?q=anki),
+licensed CC0-1.0. Anki is a trademark of its respective owner.
+
 ## License
 
 MIT

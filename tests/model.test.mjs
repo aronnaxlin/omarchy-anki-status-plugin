@@ -15,12 +15,12 @@ const report = {
 }
 
 test("barLabel uses the configured daily metric", () => {
-  assert.equal(context.barLabel(report, "Due cards"), "󰀭 12")
-  assert.equal(context.barLabel(report, "Cards studied"), "󰀭 34")
-  assert.equal(context.barLabel(report, "Study time"), "󰀭 1h 5m")
+  assert.equal(context.barLabel(report, "Due cards"), "12")
+  assert.equal(context.barLabel(report, "Cards studied"), "34")
+  assert.equal(context.barLabel(report, "Study time"), "1h 5m")
 })
 
-test("barLabel keeps the interactive icon reachable with no cards due", () => {
-  assert.equal(context.barLabel(report, "Icon only"), "󰀭")
-  assert.equal(context.barLabel({ running: true, due: 0 }, "Due cards"), "󰀭")
+test("barLabel omits text for icon-only and zero-due states", () => {
+  assert.equal(context.barLabel(report, "Icon only"), "")
+  assert.equal(context.barLabel({ running: true, due: 0 }, "Due cards"), "")
 })
