@@ -15,6 +15,18 @@ omarchy plugin add https://github.com/aronnaxlin/omarchy-anki-status-plugin.git 
 Or by hand: copy this repo into `~/.config/omarchy/plugins/aronnax.anki-status/`,
 then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable aronnax.anki-status`.
 
+## Requirements
+
+- Anki installed locally with at least one profile and collection.
+- Python 3. No Python packages beyond the standard library are required.
+
+## Remove
+
+```bash
+omarchy plugin disable aronnax.anki-status
+omarchy plugin remove aronnax.anki-status --yes
+```
+
 ## What it shows
 
 - **Bar pill** — The selected daily metric: cards due (default), cards
