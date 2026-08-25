@@ -51,6 +51,13 @@ and 30-day mature retention from `revlog`, and the new-card daily caps from
 the protobuf-encoded `deck_config` rows (a tiny hand-rolled wire parser, no
 protobuf dependency).
 
+The snapshot is bounded on every axis, because the shell buffers the whole
+document the collector prints: queries run under a 10-second deadline, the
+per-deck breakdown is capped at 40 rows (heaviest first, deck names clipped)
+with a 64 KB ceiling on the report, and the panel drops anything larger rather
+than parsing it. Profile totals stay exact — they are whole-collection
+aggregates — and the deck list says `DECKS · TOP n` whenever it was cut.
+
 ## Interactions
 
 - Bar pill: left = panel, right = sync, middle = refresh.

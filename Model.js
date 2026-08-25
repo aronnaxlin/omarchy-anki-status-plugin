@@ -61,16 +61,34 @@ function forecastMax(forecast) {
   return max
 }
 
+// Ceilings on what we will accept from the collector. bin/anki-status caps
+// its own output, but the panel is the thing a runaway report would hurt, so
+// it enforces the limit itself rather than trusting the process on the other
+// end of the pipe.
+var MAX_REPORT_CHARS = 512 * 1024
+var MAX_DECK_ROWS = 200
+
 // Parse the collector's JSON, tolerating trailing noise from stdout.
+// Oversized output is dropped rather than parsed: the panel keeps the last
+// good report, which beats spending the UI thread on a document no one
+// asked for.
 function parseReport(raw) {
   if (!raw) return null
-  var text = String(raw).trim()
+  var text = String(raw)
+  if (text.length > MAX_REPORT_CHARS) return null
+  text = text.trim()
   var start = text.indexOf("{")
   var end = text.lastIndexOf("}")
   if (start < 0 || end <= start) return null
+  var report
   try {
-    return JSON.parse(text.slice(start, end + 1))
+    report = JSON.parse(text.slice(start, end + 1))
   } catch (e) {
     return null
   }
+  if (report && report.decks && report.decks.length > MAX_DECK_ROWS) {
+    report.decks = report.decks.slice(0, MAX_DECK_ROWS)
+    report.decksTruncated = true
+  }
+  return report
 }

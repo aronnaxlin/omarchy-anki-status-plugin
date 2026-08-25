@@ -102,10 +102,18 @@ Panel {
   onScopeDeckChanged: scopeSelector.value = root.scopeDeck
   onBarMetricChanged: barDisplaySelector.value = root.barMetric
 
+  // Deck rows we ask the collector for. It caps its own output too; asking
+  // for what the list can actually show keeps the document the panel buffers
+  // small no matter how many decks the collection holds.
+  readonly property int maxDeckRows: 40
+
   function refresh() {
     if (collectorProc.running) return
-    collectorProc.command = [root.collector, "--forecast-days", String(root.forecastDays)]
+    collectorProc.command = [root.collector,
+      "--forecast-days", String(root.forecastDays),
+      "--max-decks", String(root.maxDeckRows)]
     collectorProc.running = true
+    collectorWatchdog.restart()
   }
 
   function syncNow() {
@@ -119,6 +127,7 @@ Panel {
 
   Process {
     id: collectorProc
+    onExited: collectorWatchdog.stop()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -126,6 +135,17 @@ Panel {
         if (parsed) root.report = parsed
       }
     }
+  }
+
+  // A collector that outlives its own query deadline is terminated instead of
+  // being left to accumulate output the panel would have to buffer. Clearing
+  // `running` kills it; the partial read fails to parse and the last good
+  // report stays on screen until the next tick.
+  Timer {
+    id: collectorWatchdog
+    interval: 20000
+    repeat: false
+    onTriggered: if (collectorProc.running) collectorProc.running = false
   }
 
   Process {
@@ -514,7 +534,11 @@ Panel {
           spacing: Style.space(10)
 
           PanelSectionHeader {
-            text: "DECKS"
+            // Say so when the collector capped the list, so a short list
+            // never reads as the whole collection.
+            text: root.report && root.report.decksTruncated
+              ? "DECKS · TOP " + deckList.count
+              : "DECKS"
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
