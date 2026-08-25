@@ -21,7 +21,8 @@ the Anki Status shell plugin consumes:
       "new": int, "learn": int, "review": int, "due": int, "newRemaining": int,
       "studiedToday": int, "timeTodaySec": int, "retention": float
     } ],
-    "deckCount": int,         # decks the report covers, before the row cap
+    "deckCount": int,         # deck rows before the row cap; -1 when unknown
+                              #   (the deck table outran the scan budget)
     "decksTruncated": bool,   # true when rows were dropped to stay in budget
     "error": str              # present on failure
   }
@@ -50,15 +51,28 @@ ANKI_BASE = Path(os.environ.get("ANKI_BASE", Path.home() / ".local/share/Anki2")
 
 # Output budget. The panel buffers our stdout whole, so the report has to be
 # bounded no matter what the collection looks like: at most MAX_DECK_ROWS
-# rows, each name clipped to MAX_DECK_NAME chars, and a final byte ceiling
-# that sheds rows if anything still overshoots.
+# rows, each displayed name clipped to MAX_DECK_NAME chars, the error string
+# clipped to MAX_ERROR_CHARS, and a final byte ceiling that sheds rows — and
+# failing that, falls back to a minimal record — if anything still overshoots.
 DEFAULT_DECK_ROWS = 40
 MAX_DECK_ROWS = 200
 MAX_DECK_NAME = 80
+# Characters are the wrong unit for the byte budget: json.dumps escapes
+# non-ASCII, so one CJK character costs 6 bytes and one emoji 12. An 80-char
+# name of emoji weighs most of a kilobyte, which is why displayed names are
+# also held to a byte cost, not just a length.
+MAX_DECK_NAME_BYTES = 240
+MAX_ERROR_CHARS = 2000
+# How much of a deck name is read out of the collection at all. Deck names
+# are unbounded there, and the roster holds one per deck, so the read itself
+# has to be clipped — well above MAX_DECK_NAME, since this one is the
+# aggregation key and clipping it merges decks that merely share a prefix.
+MAX_KEY_NAME = 512
 MAX_OUTPUT_BYTES = 64 * 1024
 # Deck rows read out of the collection at all. Profile totals are computed by
 # whole-table aggregates and stay exact past this; only the per-deck
-# breakdown truncates, flagged by "decksTruncated".
+# breakdown truncates, flagged by "decksTruncated". Ordering by id is for
+# determinism only — past this many decks, which ones we keep is arbitrary.
 MAX_DECK_SCAN = 5000
 # Wall clock a single snapshot may spend inside SQLite before we give up and
 # report an error instead of stalling the panel's refresh.
@@ -290,11 +304,17 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
     # collection with a pathological number of decks costs us MAX_DECK_SCAN
     # rows and no more. The profile totals above are whole-table aggregates
     # and stay exact regardless.
+    #
+    # Names are clipped in SQL, not here: nothing bounds a deck name in the
+    # collection, so reading them whole would put the roster's footprint back
+    # in the hands of whoever wrote the DB. MAX_KEY_NAME is generous enough
+    # that this is not the clip anyone sees — it is the aggregation key, and
+    # two roots would have to share that many characters to be merged.
     did_conf = {}
     deck_names = {}
     deck_scan = con.execute(
-        "SELECT id, name, common FROM decks ORDER BY id LIMIT ?",
-        (MAX_DECK_SCAN + 1,),
+        "SELECT id, substr(name, 1, ?), common FROM decks ORDER BY id LIMIT ?",
+        (MAX_KEY_NAME, MAX_DECK_SCAN + 1),
     ).fetchall()
     decks_truncated = len(deck_scan) > MAX_DECK_SCAN
     for did, name, common in deck_scan[:MAX_DECK_SCAN]:
@@ -317,16 +337,32 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
 
     # Roll decks up to their tree root so the panel shows one row per
     # top-level deck instead of one per nested list — a GRE\x1fList 30 tree
-    # is one study unit, not thirty rows. Names are clipped: they are
-    # user-supplied text that ends up in a document the shell buffers whole.
+    # is one study unit, not thirty rows. This is the aggregation key, so it
+    # is deliberately NOT clipped: two decks sharing a long prefix must stay
+    # two rows. Clipping happens at output time, in clip_name.
     def root_name(name: str) -> str:
-        root = str(name or "").split("\x1f")[0]
-        return root if len(root) <= MAX_DECK_NAME else root[:MAX_DECK_NAME - 1] + "…"
+        return str(name or "").split("\x1f")[0]
 
-    # These GROUP BY scans are streamed rather than fetched whole, and only
-    # rows for decks in the roster are kept: the result sets are as wide as
-    # the collection's deck table, and only the roster's share is worth
-    # holding in memory.
+    # Display form of a root name. Deck names are user-supplied text that
+    # ends up in a document the shell buffers whole, so the emitted string is
+    # bounded even though the key above is not — by length and by what it
+    # actually costs once escaped, which for CJK or emoji is several times
+    # its length. Converges geometrically; the panel elides at ~30 chars
+    # anyway, so nothing legible is lost.
+    def clip_name(root: str) -> str:
+        name = root[:MAX_DECK_NAME]
+        while len(name) > 1:
+            cost = len(json.dumps(name).encode())
+            if cost <= MAX_DECK_NAME_BYTES:
+                break
+            name = name[:max(1, int(len(name) * MAX_DECK_NAME_BYTES / cost))]
+        return name if name == root else name + "…"
+
+    # These GROUP BY scans are streamed rather than fetched whole: the result
+    # sets are as wide as the collection's deck table, and only the roster's
+    # share is worth holding in memory. Per-preset totals aggregate every
+    # row, roster or not, so the cap and the backlog it is compared against
+    # are always measured over the same population.
     new_introduced = {}
     for did, count in con.execute(
         """SELECT did, count(*) FROM cards
@@ -336,21 +372,19 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
         conf_id = did_conf.get(int(did), 1)
         new_introduced[conf_id] = new_introduced.get(conf_id, 0) + count
 
-    # Raw new backlog per deck, once — reused for the per-deck counts and
-    # the per-preset sibling sums.
+    # Raw new backlog, once: per deck for the roster's row counts, and summed
+    # per preset for the sibling split. Summing here rather than in an inner
+    # loop keeps the deck pass linear in the number of decks.
     deck_new_backlog = {}
+    conf_sibling_new = {}
     for did, count in con.execute(
         "SELECT did, count(*) FROM cards WHERE queue=0 AND type=0 AND odid=0 GROUP BY did"
     ):
-        if int(did) in deck_names:
-            deck_new_backlog[int(did)] = count
-
-    # Per-preset new backlog, summed once instead of re-summed per deck: the
-    # old inner loop made the deck pass quadratic in the number of decks.
-    conf_sibling_new = {}
-    for other_did, backlog in deck_new_backlog.items():
-        conf_id = did_conf.get(other_did, 1)
-        conf_sibling_new[conf_id] = conf_sibling_new.get(conf_id, 0) + backlog
+        did = int(did)
+        conf_id = did_conf.get(did, 1)
+        conf_sibling_new[conf_id] = conf_sibling_new.get(conf_id, 0) + count
+        if did in deck_names:
+            deck_new_backlog[did] = count
 
     # Today's learn/review counts for every deck in one pass. One query per
     # deck meant the collection's deck count decided how many scans we ran.
@@ -460,6 +494,18 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
         deck_rows.values(),
         key=lambda d: (-d["due"], d["name"].lower()),
     )
+    # Clip only what we emit, and only the rows that survive the cut: the
+    # rows above were keyed and sorted on the full root name. Clipping can
+    # collide — decks sharing a long prefix land on the same label — and the
+    # panel identifies a scoped deck by this string, so collisions are
+    # numbered rather than left ambiguous.
+    shown = ranked[:max_decks]
+    labels: dict[str, int] = {}
+    for row in shown:
+        label = clip_name(row["name"])
+        seen = labels.get(label, 0) + 1
+        labels[label] = seen
+        row["name"] = label if seen == 1 else "%s (%d)" % (label, seen)
 
     return {
         "profile": "",
@@ -476,25 +522,48 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
         # Heaviest decks first, then cut to the row budget: the panel shows a
         # short list and the shell buffers whatever we print, so the tail of a
         # thousand-deck collection is cost with no reader.
-        "decks": ranked[:max_decks],
-        "deckCount": len(ranked),
+        "decks": shown,
+        # -1, not a lower bound: when the deck table itself outran the scan
+        # budget, len(ranked) counts only what we looked at, and the panel
+        # would present that as the collection total. Unknown is the honest
+        # answer, and the panel drops the "OF n" when it sees it.
+        "deckCount": -1 if decks_truncated else len(ranked),
         "decksTruncated": decks_truncated or len(ranked) > max_decks,
     }
 
 
 def emit(report: dict) -> None:
-    """Print the report, shedding deck rows until it fits the byte ceiling.
+    """Print the report, holding it under the byte ceiling no matter what.
 
     The panel reads our stdout into a single buffer, so the last word on how
     large that buffer can get has to be ours. Row caps and name clipping keep
-    a normal report a few KB; this is the backstop that holds even if some
-    future field grows.
+    a normal report a few KB. Past that: the error string is clipped, deck
+    rows are shed, and if some other field is still oversized the whole
+    record is replaced by a minimal one — the ceiling is never merely
+    advisory.
     """
+    err = report.get("error")
+    if isinstance(err, str) and len(err) > MAX_ERROR_CHARS:
+        report["error"] = err[:MAX_ERROR_CHARS - 1] + "…"
     text = json.dumps(report)
     while len(text.encode()) > MAX_OUTPUT_BYTES and report.get("decks"):
-        report["decks"] = report["decks"][:len(report["decks"]) // 2]
+        # Trim to what the overage says will fit rather than halving: with
+        # CJK or emoji deck names the budget binds well before the row cap,
+        # and halving throws away rows that would have fit. The 0.95 leaves
+        # room for the fields that are not deck rows; max(1, ...) with the
+        # len-1 ceiling guarantees the loop makes progress.
+        rows = report["decks"]
+        ratio = MAX_OUTPUT_BYTES / len(text.encode())
+        keep = min(len(rows) - 1, max(0, int(len(rows) * ratio * 0.95)))
+        report["decks"] = rows[:keep]
         report["decksTruncated"] = True
         text = json.dumps(report)
+    if len(text.encode()) > MAX_OUTPUT_BYTES:
+        text = json.dumps({
+            "running": bool(report.get("running")),
+            "profile": "", "collection": "",
+            "error": "Report exceeded the output budget",
+        })
     print(text)
 
 

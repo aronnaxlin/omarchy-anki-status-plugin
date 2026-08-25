@@ -61,10 +61,16 @@ function forecastMax(forecast) {
   return max
 }
 
-// Ceilings on what we will accept from the collector. bin/anki-status caps
-// its own output, but the panel is the thing a runaway report would hurt, so
-// it enforces the limit itself rather than trusting the process on the other
-// end of the pipe.
+// Ceilings on what we will accept from the collector. bin/anki-status holds
+// its own output to 64 KB; this is deliberate slack over that — 8× — so an
+// older or hand-rolled collector still works, while output that could only
+// come from something malfunctioning is refused.
+//
+// Note what this does and does not buy: StdioCollector has already read the
+// whole stream into a string before we are called, so the real bound on what
+// the panel buffers is the collector's budget and Panel.qml's watchdog. What
+// the check here avoids is parsing and retaining a runaway document, and the
+// deck cap avoids handing the ListView a model no one can scroll.
 var MAX_REPORT_CHARS = 512 * 1024
 var MAX_DECK_ROWS = 200
 

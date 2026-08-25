@@ -52,11 +52,23 @@ the protobuf-encoded `deck_config` rows (a tiny hand-rolled wire parser, no
 protobuf dependency).
 
 The snapshot is bounded on every axis, because the shell buffers the whole
-document the collector prints: queries run under a 10-second deadline, the
-per-deck breakdown is capped at 40 rows (heaviest first, deck names clipped)
-with a 64 KB ceiling on the report, and the panel drops anything larger rather
-than parsing it. Profile totals stay exact — they are whole-collection
-aggregates — and the deck list says `DECKS · TOP n` whenever it was cut.
+document the collector prints. Queries run under a 10-second deadline, and
+the deck roster is read at most 5000 rows deep with names clipped in SQL, so
+what the collector itself holds never depends on what the collection does.
+
+The per-deck breakdown is capped at 40 rows, heaviest first. Displayed names
+are clipped by length and by escaped byte cost — a CJK or emoji character
+costs several bytes once JSON-escaped — and clipped names that collide are
+numbered, so the scope selector stays unambiguous. The whole report is held
+under 64 KB: rows are shed, and past that the record is replaced by a minimal
+one, rather than letting the ceiling be advisory. The panel keeps its own
+512 KB ceiling — deliberate slack, so an older collector still works — and
+refuses to parse anything past it.
+
+Profile totals stay exact, being whole-collection aggregates. A run that
+overruns its deadline leaves the last good numbers on screen rather than
+blanking the pill on one slow read, and the deck list says `DECKS · TOP n OF
+m` whenever it was cut.
 
 ## Interactions
 

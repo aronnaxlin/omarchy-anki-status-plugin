@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "aronnax.anki-status",
   "name": "Anki Status",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Aronnax Lin",
   "license": "MIT",
   "description": "Anki review load in the bar with a study panel: due cards, forecasts, deck breakdown, sync and review shortcuts.",

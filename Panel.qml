@@ -74,6 +74,20 @@ Panel {
     return root.report
   }
 
+  function hasDeck(name) {
+    if (!root.report || !root.report.decks) return false
+    for (var i = 0; i < root.report.decks.length; i++)
+      if (root.report.decks[i].name === name) return true
+    return false
+  }
+
+  // The collector reports only the heaviest maxDeckRows decks, so a scoped
+  // deck can drop out of the report between refreshes — study it to zero due
+  // and it falls off the end of the list. statsSource then falls back to
+  // profile-wide numbers, so the selection has to fall back with it;
+  // otherwise the grid shows whole-collection stats under a deck's name.
+  onReportChanged: if (root.scopeDeck !== "" && !root.hasDeck(root.scopeDeck)) root.scopeDeck = ""
+
   function cycleScope(direction) {
     var options = [""].concat(deckNames())
     var i = options.indexOf(root.scopeDeck)
@@ -125,6 +139,16 @@ Panel {
     Quickshell.execDetached(["anki"])
   }
 
+  // Consecutive error reports tolerated before one is allowed to replace a
+  // good one. The collector abandons a snapshot that overruns its query
+  // deadline and reports that as an error, which is well-formed JSON and so
+  // parses fine — and an error report hides the bar pill entirely. A cold
+  // cache or a collection on a slow mount can trip that deadline once
+  // without anything actually being wrong, so a lone failure leaves the last
+  // good numbers up and a real fault still surfaces on the next tick.
+  readonly property int errorGrace: 1
+  property int failedRefreshes: 0
+
   Process {
     id: collectorProc
     onExited: collectorWatchdog.stop()
@@ -132,7 +156,14 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         var parsed = Model.parseReport(text)
-        if (parsed) root.report = parsed
+        if (!parsed) return
+        var haveGood = root.report && !root.report.error
+        if (parsed.error && haveGood && root.failedRefreshes < root.errorGrace) {
+          root.failedRefreshes++
+          return
+        }
+        root.failedRefreshes = parsed.error ? root.failedRefreshes + 1 : 0
+        root.report = parsed
       }
     }
   }
@@ -535,10 +566,17 @@ Panel {
 
           PanelSectionHeader {
             // Say so when the collector capped the list, so a short list
-            // never reads as the whole collection.
-            text: root.report && root.report.decksTruncated
-              ? "DECKS · TOP " + deckList.count
-              : "DECKS"
+            // never reads as the whole collection. `deckCount` is the total
+            // before the row cap, so name it when we have it; the collector
+            // also flags a list shortened because the deck table itself
+            // outran its scan budget, and there the total is unknown.
+            text: {
+              if (!root.report || !root.report.decksTruncated) return "DECKS"
+              var total = Model.intVal(root.report.deckCount)
+              return total > deckList.count
+                ? "DECKS · TOP " + deckList.count + " OF " + total
+                : "DECKS · TOP " + deckList.count
+            }
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
