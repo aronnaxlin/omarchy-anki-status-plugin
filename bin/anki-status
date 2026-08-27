@@ -29,9 +29,13 @@ the Anki Status shell plugin consumes:
 
 Every field is bounded: the profile totals are whole-collection aggregates,
 but the per-deck breakdown is capped in rows, name length, and total bytes,
-and every query runs under a wall-clock deadline. A huge — or hostile —
-collection can therefore never hand the shell an unbounded document to
-buffer, nor keep it waiting indefinitely.
+and every query runs under a wall-clock deadline. The bound is enforced in
+SQL, not just on the way out — the deck roster is read once under a cap and
+every per-deck aggregate joins against it, so the intermediate results SQLite
+builds are bounded by the roster rather than by the collection's deck column.
+A huge — or hostile — collection can therefore never hand the shell an
+unbounded document to buffer, drive unbounded work inside SQLite, nor keep it
+waiting indefinitely.
 
 Usage: anki-status [--profile NAME] [--forecast-days N] [--collection PATH]
                    [--max-decks N]
@@ -74,9 +78,32 @@ MAX_OUTPUT_BYTES = 64 * 1024
 # breakdown truncates, flagged by "decksTruncated". Ordering by id is for
 # determinism only — past this many decks, which ones we keep is arbitrary.
 MAX_DECK_SCAN = 5000
+# Largest opaque blob column (decks.common, deck_config.config) we will read
+# at all. Both hold a small protobuf in a real collection — a few hundred
+# bytes, and we want a couple of leading varints out of each — but nothing in
+# the file format bounds them, and reading one whole is an allocation sized by
+# whoever wrote the DB. Past this a blob is treated as unparseable, which
+# lands on the same defaults an unparseable blob already did: the default
+# preset, and no daily cap.
+#
+# The test is `length(blob) <= N`, deliberately, not `substr(blob, 1, N)`:
+# SQLite answers length() from the record header without loading the value,
+# while substr() materializes the whole blob first and only then clips it —
+# 300 MB of allocation to keep 4 KB.
+MAX_BLOB_BYTES = 4096
 # Wall clock a single snapshot may spend inside SQLite before we give up and
 # report an error instead of stalling the panel's refresh.
 QUERY_DEADLINE_SEC = 10.0
+# Space budget for SQLite itself. Every per-deck aggregate is constrained to
+# the bounded roster, so a snapshot's real appetite is a few megabytes; this
+# is the backstop that turns a miss into a reported error rather than an
+# out-of-memory kill. Paired with temp_store=MEMORY so that a runaway
+# intermediate result is charged against this budget instead of spilling to
+# a temp file outside it, and with a pinned page cache — the one large
+# allocation a snapshot makes on purpose — so what is left for everything
+# else is a known quantity rather than a build default.
+SQLITE_HEAP_LIMIT_BYTES = 64 * 1024 * 1024
+SQLITE_PAGE_CACHE_KIB = 2000
 
 
 def anki_running() -> bool:
@@ -243,6 +270,16 @@ def build_report(collection: Path, forecast_days: int, max_decks: int) -> dict:
     # copy can block indefinitely on Anki's write lock.
     con = sqlite3.connect(f"file:{collection}?immutable=1", uri=True)
     try:
+        # Space budget, to go with the wall clock below. Temp b-trees and
+        # sorters are held on the heap rather than in a spill file, and the
+        # hard limit caps the lot: past it SQLite fails the statement with
+        # SQLITE_NOMEM, which main() reports as `error`. A SQLite too old for
+        # hard_heap_limit ignores the pragma, so this is a backstop and not
+        # the bound itself — the bound is that every aggregate below is
+        # constrained to the deck roster.
+        con.execute("PRAGMA temp_store = MEMORY")
+        con.execute("PRAGMA cache_size = -%d" % SQLITE_PAGE_CACHE_KIB)
+        con.execute("PRAGMA hard_heap_limit = %d" % SQLITE_HEAP_LIMIT_BYTES)
         # A corrupt or adversarial DB can make an otherwise cheap aggregate
         # run arbitrarily long. The progress handler aborts the statement
         # once the snapshot has overrun its deadline, and SQLite surfaces
@@ -287,7 +324,11 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
     # decks.common is a protobuf carrying the deck's config id (field 5);
     # deck_config rows hold the preset blob with the per-day new cap.
     conf_caps = {}
-    for conf_id, blob in con.execute("SELECT id, config FROM deck_config LIMIT ?", (MAX_DECK_SCAN,)):
+    for conf_id, blob in con.execute(
+        """SELECT id, CASE WHEN length(config) <= ? THEN config END
+           FROM deck_config LIMIT ?""",
+        (MAX_BLOB_BYTES, MAX_DECK_SCAN),
+    ):
         conf_caps[int(conf_id)] = deck_config_new_per_day(blob)
 
     def deck_conf_id(common: bytes) -> int:
@@ -300,7 +341,7 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
         return 1
 
     # --- deck roster ------------------------------------------------------
-    # Read once, capped: everything per-deck below keys off this dict, so a
+    # Read once, capped: everything per-deck below keys off this roster, so a
     # collection with a pathological number of decks costs us MAX_DECK_SCAN
     # rows and no more. The profile totals above are whole-table aggregates
     # and stay exact regardless.
@@ -310,17 +351,37 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
     # in the hands of whoever wrote the DB. MAX_KEY_NAME is generous enough
     # that this is not the clip anyone sees — it is the aggregation key, and
     # two roots would have to share that many characters to be merged.
+    #
+    # substr() has to load the value before it clips it, so a single absurd
+    # name is the one read here still sized by the DB. We want its prefix, so
+    # there is no length() trick to play; it is the hard heap limit that keeps
+    # it to a reported error rather than an out-of-memory kill.
     did_conf = {}
     deck_names = {}
-    deck_scan = con.execute(
-        "SELECT id, substr(name, 1, ?), common FROM decks ORDER BY id LIMIT ?",
-        (MAX_KEY_NAME, MAX_DECK_SCAN + 1),
-    ).fetchall()
-    decks_truncated = len(deck_scan) > MAX_DECK_SCAN
-    for did, name, common in deck_scan[:MAX_DECK_SCAN]:
+    decks_truncated = False
+    for did, name, common in con.execute(
+        """SELECT id, substr(name, 1, ?),
+                  CASE WHEN length(common) <= ? THEN common END
+           FROM decks ORDER BY id LIMIT ?""",
+        (MAX_KEY_NAME, MAX_BLOB_BYTES, MAX_DECK_SCAN + 1),
+    ):
+        if len(deck_names) >= MAX_DECK_SCAN:
+            decks_truncated = True
+            break
         did_conf[int(did)] = deck_conf_id(common)
         deck_names[int(did)] = name
-    del deck_scan
+
+    # The roster, in SQL. Every per-deck aggregate below joins against this
+    # table instead of grouping by the raw deck column and being filtered
+    # here: filtering in Python bounded what we retained, but SQLite still
+    # had to build one aggregate row per distinct deck id in the collection
+    # first, which a hostile DB chooses. Joined, the widest intermediate
+    # result any of them can have is the roster's MAX_DECK_SCAN rows.
+    con.execute("CREATE TEMP TABLE roster(did INTEGER PRIMARY KEY)")
+    con.executemany(
+        "INSERT OR IGNORE INTO temp.roster(did) VALUES (?)",
+        ((did,) for did in deck_names),
+    )
 
     # Same, per deck: revlog carries cid, not did, so resolve through cards.
     # A deleted card's reviews still count toward the profile total but fall
@@ -329,11 +390,11 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
     for did, count, secs in con.execute(
         """SELECT c.did, count(*), coalesce(sum(r.time)/1000, 0)
            FROM revlog r JOIN cards c ON c.id = r.cid
+                         JOIN temp.roster t ON t.did = c.did
            WHERE r.id >= ? GROUP BY c.did""",
         (today_start_ms,),
     ):
-        if int(did) in deck_names:
-            deck_studied[int(did)] = [int(count), int(secs or 0)]
+        deck_studied[int(did)] = [int(count), int(secs or 0)]
 
     # Roll decks up to their tree root so the panel shows one row per
     # top-level deck instead of one per nested list — a GRE\x1fList 30 tree
@@ -358,16 +419,19 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
             name = name[:max(1, int(len(name) * MAX_DECK_NAME_BYTES / cost))]
         return name if name == root else name + "…"
 
-    # These GROUP BY scans are streamed rather than fetched whole: the result
-    # sets are as wide as the collection's deck table, and only the roster's
-    # share is worth holding in memory. Per-preset totals aggregate every
-    # row, roster or not, so the cap and the backlog it is compared against
-    # are always measured over the same population.
+    # These GROUP BY scans are streamed rather than fetched whole, and each
+    # is joined to the roster so SQLite aggregates over the roster too. Past
+    # MAX_DECK_SCAN decks that makes the per-preset totals roster-scoped —
+    # but so is the backlog they are compared against below, so the cap and
+    # its consumption are still measured over the same population. Under the
+    # scan cap, which is every real collection, the roster is every deck and
+    # the totals are exact.
     new_introduced = {}
     for did, count in con.execute(
-        """SELECT did, count(*) FROM cards
-           WHERE queue > 0 AND type IN (1,2)
-           GROUP BY did"""
+        """SELECT c.did, count(*) FROM cards c
+           JOIN temp.roster t ON t.did = c.did
+           WHERE c.queue > 0 AND c.type IN (1,2)
+           GROUP BY c.did"""
     ):
         conf_id = did_conf.get(int(did), 1)
         new_introduced[conf_id] = new_introduced.get(conf_id, 0) + count
@@ -378,26 +442,27 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
     deck_new_backlog = {}
     conf_sibling_new = {}
     for did, count in con.execute(
-        "SELECT did, count(*) FROM cards WHERE queue=0 AND type=0 AND odid=0 GROUP BY did"
+        """SELECT c.did, count(*) FROM cards c
+           JOIN temp.roster t ON t.did = c.did
+           WHERE c.queue=0 AND c.type=0 AND c.odid=0 GROUP BY c.did"""
     ):
         did = int(did)
         conf_id = did_conf.get(did, 1)
         conf_sibling_new[conf_id] = conf_sibling_new.get(conf_id, 0) + count
-        if did in deck_names:
-            deck_new_backlog[did] = count
+        deck_new_backlog[did] = count
 
     # Today's learn/review counts for every deck in one pass. One query per
     # deck meant the collection's deck count decided how many scans we ran.
     deck_today = {}
     for did, learn_c, review_c in con.execute(
-        """SELECT did,
-                 sum(CASE WHEN queue IN (1,3) AND odid=0 AND due <= ? THEN 1 ELSE 0 END),
-                 sum(CASE WHEN queue=2 AND odid=0 AND due <= ? THEN 1 ELSE 0 END)
-           FROM cards GROUP BY did""",
+        """SELECT c.did,
+                 sum(CASE WHEN c.queue IN (1,3) AND c.odid=0 AND c.due <= ? THEN 1 ELSE 0 END),
+                 sum(CASE WHEN c.queue=2 AND c.odid=0 AND c.due <= ? THEN 1 ELSE 0 END)
+           FROM cards c JOIN temp.roster t ON t.did = c.did
+           GROUP BY c.did""",
         (int(today_start_sec + day_len), day_cutoff_end),
     ):
-        if int(did) in deck_names:
-            deck_today[int(did)] = (int(learn_c or 0), int(review_c or 0))
+        deck_today[int(did)] = (int(learn_c or 0), int(review_c or 0))
 
     conf_remaining = {}
     for conf_id, cap in conf_caps.items():
@@ -473,11 +538,10 @@ def query_report(con: sqlite3.Connection, forecast_days: int, max_decks: int) ->
         """SELECT c.did,
                   sum(CASE WHEN r.ease > 1 THEN 1 ELSE 0 END), count(*)
            FROM revlog r JOIN cards c ON c.id = r.cid
+                         JOIN temp.roster t ON t.did = c.did
            WHERE r.id >= ? AND r.lastIvl >= 21 GROUP BY c.did""",
         (today_start_ms - 30 * day_len * 1000,),
     ):
-        if int(did) not in deck_names:
-            continue
         name = root_name(deck_names[int(did)])
         acc = deck_retention.setdefault(name, [0, 0])
         acc[0] += int(correct or 0)
@@ -602,6 +666,14 @@ def main() -> int:
         )
         data.pop("profile", None)
         report.update(data)
+    except MemoryError:
+        # SQLite refused an allocation past SQLITE_HEAP_LIMIT_BYTES: some
+        # single value in the collection is larger than a whole snapshot's
+        # space budget. Reported rather than raised — the alternative to
+        # failing the statement is the OOM killer — and given a message,
+        # since the panel puts this string in front of the user and
+        # MemoryError carries none of its own.
+        report["error"] = "Collection needs more memory than one snapshot may use"
     except Exception as exc:  # surface as JSON, never crash the panel
         report["error"] = f"{type(exc).__name__}: {exc}"
 
