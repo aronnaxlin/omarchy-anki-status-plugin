@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """anki-status — read-only snapshot of the local Anki collection as JSON.
 
-Reads the Anki collection DB through SQLite's immutable mode — no locks, so
-Anki's own writes never stall us; the WAL tail (at most the review currently
-on screen) is skipped, which is fine for a status widget. Prints the record
-the Anki Status shell plugin consumes:
+Reads the Anki collection DB read-only, taking no locks and never stalling
+behind Anki's own writes, and reading the live state — reviews land in the
+WAL and are ours to see the moment Anki commits them, not whenever SQLite
+next folds the WAL into the main file. Prints the record the Anki Status
+shell plugin consumes:
 
   {
     "running": bool,
@@ -94,6 +95,11 @@ MAX_BLOB_BYTES = 4096
 # Wall clock a single snapshot may spend inside SQLite before we give up and
 # report an error instead of stalling the panel's refresh.
 QUERY_DEADLINE_SEC = 10.0
+# How long a statement may wait on a lock before we give up on the live read
+# and fall back to the checkpointed one. Only reachable on a collection in
+# rollback-journal mode, where a reader and Anki's writer do contend; in WAL
+# mode, which is what Anki actually uses, readers never wait.
+LOCK_WAIT_MS = 200
 # Space budget for SQLite itself. Every per-deck aggregate is constrained to
 # the bounded roster, so a snapshot's real appetite is a few megabytes; this
 # is the backstop that turns a miss into a reported error rather than an
@@ -262,13 +268,55 @@ def deck_config_new_per_day(blob: bytes) -> int:
     return 0
 
 
+def open_collection(collection: Path) -> sqlite3.Connection:
+    """Open the collection read-only, preferring the live state.
+
+    Anki keeps the collection in WAL mode. It holds one transaction open from
+    startup until its first commit — the backup it takes on opening a profile
+    — and from then on each answered card is committed as its own
+    transaction, landing in collection.anki2-wal immediately. What it does
+    not do is reach the main database file: that waits for a checkpoint,
+    which SQLite runs once the WAL passes about a thousand pages and Anki
+    runs when it closes.
+
+    That matters because `immutable=1` promises SQLite the file cannot change
+    and it may therefore ignore the WAL entirely. It costs nothing and takes
+    no locks, but it reads only the main file — so during a session it showed
+    the last checkpoint, not the collection. Measured against Anki's own
+    library on a real collection: eight cards answered, "studied today" stuck
+    at zero for all eight, then jumping to eight when Anki closed. And the
+    part that gives the game away, which is how this was reported: refreshing
+    changed nothing, because every run re-read the same checkpointed
+    snapshot. A read-only connection tracked all eight, one by one.
+
+    A read-only connection sees the WAL. It also cannot write, so it cannot
+    take Anki's write lock, and WAL readers do not wait on the writer — the
+    original reason for immutable mode, which was to never stall behind
+    Anki, holds without it.
+
+    Two cases still need the old open, so it stays as a fallback: a
+    collection in rollback-journal mode whose writer holds the lock (we wait
+    LOCK_WAIT_MS, no longer), and a WAL left behind by a crash, which only a
+    writer may recover. Both give slightly stale numbers, which is what this
+    function's whole job is to avoid — but stale beats nothing.
+    """
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{collection}?mode=ro", uri=True, timeout=0)
+        con.execute("PRAGMA busy_timeout = %d" % LOCK_WAIT_MS)
+        # Opening is lazy about the WAL: the shm is mapped and the journal
+        # recovered on first read, so any reason this cannot be the live read
+        # surfaces here rather than midway through the report.
+        con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        return con
+    except sqlite3.Error:
+        if con is not None:
+            con.close()
+    return sqlite3.connect(f"file:{collection}?immutable=1", uri=True)
+
+
 def build_report(collection: Path, forecast_days: int, max_decks: int) -> dict:
-    # Immutable mode: SQLite opens the file without taking locks, reading the
-    # last committed main-file state. The WAL tail (at most the currently open
-    # review) is skipped, which is fine for a status widget and keeps us from
-    # ever stalling behind Anki's own writes — a plain read or a backup-API
-    # copy can block indefinitely on Anki's write lock.
-    con = sqlite3.connect(f"file:{collection}?immutable=1", uri=True)
+    con = open_collection(collection)
     try:
         # Space budget, to go with the wall clock below. Temp b-trees and
         # sorters are held on the heap rather than in a spill file, and the

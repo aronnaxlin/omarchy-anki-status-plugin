@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 // Anki Status: bar pill with the due count, popup with today's queues, the
 // week-ahead forecast, per-deck breakdown, and sync/review shortcuts.
-// Data comes from bin/anki-status (read-only, immutable-mode SQLite) on a
-// refresh timer and on every panel open.
+// Data comes from bin/anki-status (a read-only SQLite snapshot) on a refresh
+// timer and on every panel open.
 Panel {
   id: root
   moduleName: "aronnax.anki-status"
@@ -20,7 +20,14 @@ Panel {
   manageIpc: false
 
   readonly property string collector: Quickshell.env("HOME") + "/.config/omarchy/plugins/aronnax.anki-status/bin/anki-status"
+  // How often to re-read the collection. Anki being open is the only reason
+  // the numbers move on their own, so the idle cadence is slow and the one
+  // that runs during a session is not: mid-review, "studied today" going
+  // five minutes stale is the whole difference between a live widget and a
+  // decoration. A snapshot costs ~60 ms on a 27 MB collection.
   readonly property int refreshIntervalSec: setting("refreshIntervalSec", 300)
+  readonly property int activeRefreshIntervalSec: setting("activeRefreshIntervalSec", 30)
+  readonly property bool ankiRunning: !!(report && report.running)
   readonly property int forecastDays: setting("forecastDays", 7)
   readonly property string barMetric: String(setting("barMetric", "Due cards"))
 
@@ -185,7 +192,8 @@ Panel {
   }
 
   Timer {
-    interval: Math.max(30, root.refreshIntervalSec) * 1000
+    interval: Math.max(5, root.ankiRunning ? root.activeRefreshIntervalSec
+                                           : root.refreshIntervalSec) * 1000
     running: true
     repeat: true
     triggeredOnStart: true
